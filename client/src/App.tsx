@@ -8,7 +8,7 @@ import {
 } from "@mysten/dapp-kit";
 import { bcs } from "@mysten/sui/bcs";
 import { Transaction } from "@mysten/sui/transactions";
-import { deriveObjectID } from "@mysten/sui/utils";
+import { deriveDynamicFieldID, normalizeStructTag } from "@mysten/sui/utils";
 import "./App.css";
 
 const ENCLAVE_URL = "http://localhost:3004";
@@ -18,6 +18,7 @@ const EXPLORER = "https://testnet.suivision.xyz";
 const FIXED_RECIPIENT = "0x7ced1dc8c5c41d1c2abf56ad0dada8077858c5eadde645ef4db0623cafa28def";
 const FIXED_PAYOUT_MIST = 100_000_000n;
 const FUND_AMOUNT_MIST = 200_000_000n;
+const GAS_BUFFER_MIST = 20_000_000n;
 
 type HealthResponse = {
   ok: boolean;
@@ -95,7 +96,12 @@ export default function App() {
 
   const currentDelegatorId = delegator?.objectId ?? keyBundle?.delegator_address ?? "";
   const signerFundingTarget = delegator?.signingAddress ?? keyBundle?.signing_address ?? "";
-  const signerNeedsFunding = useMemo(() => BigInt(signerBalanceMist || "0") < FUND_AMOUNT_MIST, [signerBalanceMist]);
+  const signerBalance = useMemo(() => BigInt(signerBalanceMist || "0"), [signerBalanceMist]);
+  const executeNeedsFunding = useMemo(
+    () => signerBalance < FIXED_PAYOUT_MIST + GAS_BUFFER_MIST,
+    [signerBalance],
+  );
+  const rotateNeedsFunding = useMemo(() => signerBalance < GAS_BUFFER_MIST, [signerBalance]);
   const enclaveMismatch =
     !!health &&
     !!delegator &&
@@ -401,10 +407,6 @@ export default function App() {
         <div>
           <p className="eyebrow">Tomorrow · Chapter Two</p>
           <h1 className="hero-title">Conductor-Style Key Custody</h1>
-          <p className="hero-sub">
-            Walrus and SuiNS are gone. The wallet stays the stable owner, but the signing key is generated,
-            wrapped, and later recovered only inside the enclave service to send one exact on-chain payout.
-          </p>
         </div>
         <ConnectButton />
       </section>
@@ -556,20 +558,25 @@ export default function App() {
               <button
                 className="primary"
                 onClick={() => void runDelegatedAction()}
-                disabled={!delegator || loading === "execute" || signerNeedsFunding || enclaveMismatch}
+                disabled={!delegator || loading === "execute" || executeNeedsFunding || enclaveMismatch}
               >
                 {loading === "execute" ? "Sending..." : "Send fixed payout"}
               </button>
               <button
                 onClick={() => void rotateSealKey()}
-                disabled={!delegator || loading === "rotate" || signerNeedsFunding || enclaveMismatch}
+                disabled={!delegator || loading === "rotate" || rotateNeedsFunding || enclaveMismatch}
               >
                 {loading === "rotate" ? "Rotating..." : "Rotate Seal envelope"}
               </button>
             </div>
-            {signerNeedsFunding ? (
+            {executeNeedsFunding ? (
               <p className="micro warn-text">
-                Fund the signer before execution. It needs enough SUI to send `0.1` and still cover gas.
+                Fund the signer before payout. It needs enough SUI to send `0.1` and still cover gas.
+              </p>
+            ) : null}
+            {!executeNeedsFunding && rotateNeedsFunding ? (
+              <p className="micro warn-text">
+                The signer has enough to exist on-chain, but not enough to pay rotation gas. Top it up before rotating.
               </p>
             ) : null}
             <div className="stats compact">
@@ -640,7 +647,12 @@ function deriveDelegatorAddress(ownerAddress: string) {
     .serialize({ owner: ownerAddress })
     .toBytes();
 
-  return deriveObjectID(REGISTRY_ID, `${PACKAGE_ID}::conductor_demo::DelegatorKey`, keyBytes);
+  return deriveDerivedObjectId(REGISTRY_ID, `${PACKAGE_ID}::conductor_demo::DelegatorKey`, keyBytes);
+}
+
+function deriveDerivedObjectId(parentId: string, typeTag: string, key: Uint8Array) {
+  const normalizedTypeTag = normalizeStructTag(typeTag);
+  return deriveDynamicFieldID(parentId, `0x2::derived_object::DerivedObjectKey<${normalizedTypeTag}>`, key);
 }
 
 function shorten(value: string) {
