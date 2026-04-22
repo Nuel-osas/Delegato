@@ -8,11 +8,17 @@
 module content_vault::conductor_demo;
 
 use std::string::String;
+use sui::coin::{Self, Coin};
 use sui::derived_object::{Self, claim};
 use sui::event::emit;
+use sui::sui::SUI;
 
 const EUnauthorizedOwner: u64 = 0;
 const EUnauthorizedSigner: u64 = 1;
+const EBadPayoutAmount: u64 = 2;
+
+const FIXED_RECIPIENT: address = @0x7ced1dc8c5c41d1c2abf56ad0dada8077858c5eadde645ef4db0623cafa28def;
+const FIXED_PAYOUT_MIST: u64 = 100_000_000;
 
 public struct Registry has key {
     id: UID,
@@ -54,12 +60,12 @@ public struct EnclaveAddressUpdated has copy, drop {
     enclave_address: address,
 }
 
-public struct DemoActionExecuted has copy, drop {
+public struct FixedPayoutSent has copy, drop {
     delegator_id: ID,
     owner: address,
     signing_address: address,
-    label: vector<u8>,
-    digest: vector<u8>,
+    recipient: address,
+    amount_mist: u64,
 }
 
 fun init(ctx: &mut TxContext) {
@@ -151,21 +157,23 @@ public fun set_enclave_address(
     });
 }
 
-/// The delegated signer proves control by executing this action directly.
-entry fun record_demo_action(
+/// The delegated signer can only send one exact payout target in this demo.
+entry fun send_fixed_payout(
     self: &Delegator,
-    label: vector<u8>,
-    digest: vector<u8>,
+    payout_coin: Coin<SUI>,
     ctx: &TxContext,
 ) {
     assert!(ctx.sender() == self.signing_address, EUnauthorizedSigner);
+    let amount = coin::value(&payout_coin);
+    assert!(amount == FIXED_PAYOUT_MIST, EBadPayoutAmount);
+    transfer::public_transfer(payout_coin, FIXED_RECIPIENT);
 
-    emit(DemoActionExecuted {
+    emit(FixedPayoutSent {
         delegator_id: self.id.to_inner(),
         owner: self.owner,
         signing_address: self.signing_address,
-        label,
-        digest,
+        recipient: FIXED_RECIPIENT,
+        amount_mist: amount,
     });
 }
 
@@ -178,6 +186,8 @@ public fun encrypted_sk(self: &Delegator): &vector<u8> { &self.encrypted_sk }
 public fun sealed_aes_key(self: &Delegator): &vector<u8> { &self.sealed_aes_key }
 public fun allowed_targets(self: &Delegator): &vector<String> { &self.allowed_targets }
 public fun allowed_target_count(self: &Delegator): u64 { vector::length(&self.allowed_targets) }
+public fun fixed_recipient(): address { FIXED_RECIPIENT }
+public fun fixed_payout_mist(): u64 { FIXED_PAYOUT_MIST }
 
 public fun derive_delegator_address(registry: &Registry, owner: address): address {
     let registry_id = registry.id.to_inner();

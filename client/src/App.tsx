@@ -10,10 +10,12 @@ import { Transaction } from "@mysten/sui/transactions";
 import "./App.css";
 
 const ENCLAVE_URL = "http://localhost:3004";
-const PACKAGE_ID: string = "0xd8eac0d55f7a996922776a1b553ef8472282f027c4ac12c89427cfb5d1dfcca7";
-const REGISTRY_ID: string = "0xe16d6d96a9215b500680629afa93caba495466260994be2b3ca9eabe105eb49e";
+const PACKAGE_ID: string = "0xe616c1efee02f30462788cbd20c04d2a4a640cca91e62a5d3f0b178f4155512b";
+const REGISTRY_ID: string = "0x4990d853c6073971aaf9d1a9238304431d79a7f13768386faebdcbd0c14f35cf";
 const EXPLORER = "https://testnet.suivision.xyz";
-const FUND_AMOUNT_MIST = 20_000_000n;
+const FIXED_RECIPIENT = "0x7ced1dc8c5c41d1c2abf56ad0dada8077858c5eadde645ef4db0623cafa28def";
+const FIXED_PAYOUT_MIST = 100_000_000n;
+const FUND_AMOUNT_MIST = 200_000_000n;
 
 type HealthResponse = {
   ok: boolean;
@@ -24,6 +26,8 @@ type HealthResponse = {
   enclave_address: string;
   enclave_public_key: string;
   allowed_target: string;
+  fixed_recipient: string;
+  fixed_payout_mist: string;
   endpoints: Record<string, boolean>;
 };
 
@@ -53,10 +57,10 @@ type DelegatorView = {
 
 type ExecuteResponse = {
   digest: string;
-  label: string;
-  digest_hex: string;
   signing_address: string;
   key_version: string;
+  recipient: string;
+  amount_mist: string;
 };
 
 type RotateResponse = {
@@ -77,7 +81,6 @@ export default function App() {
   const [keyBundle, setKeyBundle] = useState<KeygenResponse | null>(null);
   const [delegator, setDelegator] = useState<DelegatorView | null>(null);
   const [signerBalanceMist, setSignerBalanceMist] = useState<string>("0");
-  const [actionLabel, setActionLabel] = useState("rotate payouts for week one");
   const [lastServerAction, setLastServerAction] = useState<ExecuteResponse | null>(null);
   const [lastRotation, setLastRotation] = useState<RotateResponse | null>(null);
   const [createDigest, setCreateDigest] = useState<string | null>(null);
@@ -259,7 +262,7 @@ export default function App() {
   }
 
   async function runDelegatedAction() {
-    if (!currentDelegatorId || !actionLabel.trim()) return;
+    if (!currentDelegatorId) return;
 
     setError(null);
     setLoading("execute");
@@ -269,7 +272,6 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           delegator_id: currentDelegatorId,
-          label: actionLabel.trim(),
         }),
       });
 
@@ -344,7 +346,7 @@ export default function App() {
           <h1 className="hero-title">Conductor-Style Key Custody</h1>
           <p className="hero-sub">
             Walrus and SuiNS are gone. The wallet stays the stable owner, but the signing key is generated,
-            wrapped, and later recovered only inside the enclave service.
+            wrapped, and later recovered only inside the enclave service to send one exact on-chain payout.
           </p>
         </div>
         <ConnectButton />
@@ -383,6 +385,8 @@ export default function App() {
                 <Stat label="Registry">{shorten(health.registry_id)}</Stat>
                 <Stat label="Enclave">{shorten(health.enclave_address)}</Stat>
                 <Stat label="Allowlisted target">{health.allowed_target}</Stat>
+                <Stat label="Fixed recipient">{shorten(health.fixed_recipient)}</Stat>
+                <Stat label="Fixed payout">{formatSui(health.fixed_payout_mist)} SUI</Stat>
               </div>
             ) : null}
           </section>
@@ -418,7 +422,7 @@ export default function App() {
             <h2>Wallet Setup</h2>
             <p className="card-hint">
               The wallet creates the derived on-chain delegator, then funds the generated signer with a small amount
-              of SUI so the enclave-controlled key can submit transactions directly.
+              of SUI so the enclave-controlled key can send the fixed `0.1 SUI` payout and still pay gas.
             </p>
             <div className="actions">
               <button
@@ -432,7 +436,7 @@ export default function App() {
                 onClick={() => void fundSigner()}
                 disabled={!keyBundle || loading === "fund" || isPending}
               >
-                {loading === "fund" ? "Funding..." : "Fund signer with 0.02 SUI"}
+                {loading === "fund" ? "Funding..." : "Fund signer with 0.2 SUI"}
               </button>
               <button onClick={() => void refreshDelegator()} disabled={!currentDelegatorId || loading === "refresh"}>
                 {loading === "refresh" ? "Refreshing..." : "Refresh delegator"}
@@ -480,24 +484,20 @@ export default function App() {
             <h2>Delegated Action</h2>
             <p className="card-hint">
               The enclave service now decrypts the Seal-wrapped AES key, decrypts the stored signer seed, and submits
-              the allowlisted transaction directly from the funded signer address.
+              the allowlisted transaction directly from the funded signer address. In this version the delegated signer
+              can do only one thing: send exactly `0.1 SUI` to the fixed recipient.
             </p>
-            <label className="field">
-              <span>Action label</span>
-              <input
-                className="text"
-                value={actionLabel}
-                onChange={(event) => setActionLabel(event.target.value)}
-                placeholder="enter a label for the demo action"
-              />
-            </label>
+            <div className="stats compact">
+              <Stat label="Recipient">{shorten(FIXED_RECIPIENT)}</Stat>
+              <Stat label="Amount">{formatSui(FIXED_PAYOUT_MIST.toString())} SUI</Stat>
+            </div>
             <div className="actions">
               <button
                 className="primary"
                 onClick={() => void runDelegatedAction()}
                 disabled={!delegator || loading === "execute" || signerNeedsFunding || enclaveMismatch}
               >
-                {loading === "execute" ? "Executing..." : "Execute via enclave signer"}
+                {loading === "execute" ? "Sending..." : "Send fixed payout"}
               </button>
               <button
                 onClick={() => void rotateSealKey()}
@@ -507,11 +507,16 @@ export default function App() {
               </button>
             </div>
             {signerNeedsFunding ? (
-              <p className="micro warn-text">Fund the signer before server-side execution. It needs gas to submit.</p>
+              <p className="micro warn-text">
+                Fund the signer before execution. It needs enough SUI to send `0.1` and still cover gas.
+              </p>
             ) : null}
             <div className="stats compact">
-              <Stat label="Execute tx">{lastServerAction ? linkTx(lastServerAction.digest) : "Not submitted"}</Stat>
+              <Stat label="Payout tx">{lastServerAction ? linkTx(lastServerAction.digest) : "Not submitted"}</Stat>
               <Stat label="Rotation tx">{lastRotation ? linkTx(lastRotation.digest) : "Not submitted"}</Stat>
+              <Stat label="Last payout recipient">
+                {lastServerAction ? shorten(lastServerAction.recipient) : shorten(FIXED_RECIPIENT)}
+              </Stat>
               <Stat label="Current key version">
                 {lastRotation ? lastRotation.next_key_version : delegator?.keyVersion ?? "0"}
               </Stat>
@@ -527,6 +532,7 @@ export default function App() {
               <li>Removed browser-side Seal decrypt and removed Walrus/SuiNS entirely.</li>
               <li>Stored `encrypted_sk`, `sealed_aes_key`, and `key_version` directly on the delegator.</li>
               <li>Made the owner wallet stable while the funded signer executes from the enclave path.</li>
+              <li>Locked execution to one fixed `0.1 SUI` payout target instead of a generic action.</li>
               <li>Added Seal envelope rotation without re-encrypting the underlying signing key.</li>
             </ul>
           </section>

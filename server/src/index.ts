@@ -8,12 +8,14 @@ import { deriveObjectID } from "@mysten/sui/utils";
 import { verifyPersonalMessageSignature } from "@mysten/sui/verify";
 
 const PORT = 3004;
-const PACKAGE_ID: string = "0xd8eac0d55f7a996922776a1b553ef8472282f027c4ac12c89427cfb5d1dfcca7";
-const REGISTRY_ID: string = "0xe16d6d96a9215b500680629afa93caba495466260994be2b3ca9eabe105eb49e";
+const PACKAGE_ID: string = "0xe616c1efee02f30462788cbd20c04d2a4a640cca91e62a5d3f0b178f4155512b";
+const REGISTRY_ID: string = "0x4990d853c6073971aaf9d1a9238304431d79a7f13768386faebdcbd0c14f35cf";
 const NETWORK = "testnet";
 const SESSION_TTL_MIN = 5;
 const SEAL_THRESHOLD = 1;
-const DEMO_TARGET = `${PACKAGE_ID}::conductor_demo::record_demo_action`;
+const FIXED_RECIPIENT = "0x7ced1dc8c5c41d1c2abf56ad0dada8077858c5eadde645ef4db0623cafa28def";
+const FIXED_PAYOUT_MIST = 100_000_000n;
+const DEMO_TARGET = `${PACKAGE_ID}::conductor_demo::send_fixed_payout`;
 const SEAL_SERVER_CONFIGS = [
   {
     objectId: "0xb012378c9f3799fb5b1a7083da74a4069e3c3f1c93de0b27212a5799ce1e1e98",
@@ -31,6 +33,8 @@ type HealthResponse = {
   enclave_address: string;
   enclave_public_key: string;
   allowed_target: string;
+  fixed_recipient: string;
+  fixed_payout_mist: string;
   endpoints: Record<string, boolean>;
 };
 
@@ -55,15 +59,14 @@ type KeygenResponse = {
 
 type ExecuteRequest = {
   delegator_id: string;
-  label: string;
 };
 
 type ExecuteResponse = {
   digest: string;
-  label: string;
-  digest_hex: string;
   signing_address: string;
   key_version: string;
+  recipient: string;
+  amount_mist: string;
 };
 
 type RotateRequest = {
@@ -166,6 +169,8 @@ function buildHealthResponse(): HealthResponse {
     enclave_address: enclaveKeypair.toSuiAddress(),
     enclave_public_key: bytesToHex(enclaveKeypair.getPublicKey().toRawBytes()),
     allowed_target: DEMO_TARGET,
+    fixed_recipient: FIXED_RECIPIENT,
+    fixed_payout_mist: FIXED_PAYOUT_MIST.toString(),
     endpoints: {
       keygen: true,
       execute: true,
@@ -213,8 +218,8 @@ async function handleKeygen(body: KeygenRequest): Promise<KeygenResponse> {
 }
 
 async function handleExecute(body: ExecuteRequest): Promise<ExecuteResponse> {
-  if (!body.delegator_id || !body.label.trim()) {
-    throw new Error("delegator_id and label are required");
+  if (!body.delegator_id) {
+    throw new Error("delegator_id is required");
   }
 
   const delegator = await fetchDelegator(body.delegator_id);
@@ -232,19 +237,14 @@ async function handleExecute(body: ExecuteRequest): Promise<ExecuteResponse> {
       throw new Error("recovered signing key does not match delegator signing_address");
     }
 
-    const labelBytes = new TextEncoder().encode(body.label.trim());
-    const digestBytes = await sha256Bytes(
-      new TextEncoder().encode(`${delegator.objectId}|${body.label.trim()}|${Date.now()}`),
-    );
-
     const tx = new Transaction();
     tx.setSender(delegator.signingAddress);
+    const [payoutCoin] = tx.splitCoins(tx.gas, [FIXED_PAYOUT_MIST]);
     tx.moveCall({
       target: DEMO_TARGET,
       arguments: [
         tx.object(delegator.objectId),
-        tx.pure.vector("u8", Array.from(labelBytes)),
-        tx.pure.vector("u8", Array.from(digestBytes)),
+        payoutCoin,
       ],
     });
 
@@ -256,10 +256,10 @@ async function handleExecute(body: ExecuteRequest): Promise<ExecuteResponse> {
 
     return {
       digest: result.digest,
-      label: body.label.trim(),
-      digest_hex: bytesToHex(digestBytes),
       signing_address: delegator.signingAddress,
       key_version: delegator.keyVersion.toString(),
+      recipient: FIXED_RECIPIENT,
+      amount_mist: FIXED_PAYOUT_MIST.toString(),
     };
   } finally {
     signingSeed.fill(0);
@@ -452,10 +452,6 @@ async function aesDecrypt(keyBytes: Uint8Array, payload: Uint8Array) {
       asBufferSource(ciphertext),
     ),
   );
-}
-
-async function sha256Bytes(bytes: Uint8Array) {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", asBufferSource(bytes)));
 }
 
 async function readJson<T>(req: IncomingMessage): Promise<T> {
