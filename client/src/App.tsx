@@ -6,7 +6,9 @@ import {
   useSignPersonalMessage,
   useSuiClient,
 } from "@mysten/dapp-kit";
+import { bcs } from "@mysten/sui/bcs";
 import { Transaction } from "@mysten/sui/transactions";
+import { deriveObjectID } from "@mysten/sui/utils";
 import "./App.css";
 
 const ENCLAVE_URL = "http://localhost:3004";
@@ -91,7 +93,8 @@ export default function App() {
   >(null);
   const [error, setError] = useState<string | null>(null);
 
-  const currentDelegatorId = keyBundle?.delegator_address ?? delegator?.objectId ?? "";
+  const currentDelegatorId = delegator?.objectId ?? keyBundle?.delegator_address ?? "";
+  const signerFundingTarget = delegator?.signingAddress ?? keyBundle?.signing_address ?? "";
   const signerNeedsFunding = useMemo(() => BigInt(signerBalanceMist || "0") < FUND_AMOUNT_MIST, [signerBalanceMist]);
   const enclaveMismatch =
     !!health &&
@@ -101,6 +104,41 @@ export default function App() {
   useEffect(() => {
     void checkHealth();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function syncWalletDelegator() {
+      setKeyBundle(null);
+      setDelegator(null);
+      setSignerBalanceMist("0");
+      setLastServerAction(null);
+      setLastRotation(null);
+      setCreateDigest(null);
+      setFundDigest(null);
+      setRebindDigest(null);
+      setError(null);
+
+      if (!account || !PACKAGE_CONFIGURED) return;
+
+      const objectId = deriveDelegatorAddress(account.address);
+      const existingDelegator = await readDelegator(suiClient, objectId);
+      if (cancelled || !existingDelegator) return;
+
+      setDelegator(existingDelegator);
+
+      const balance = await suiClient.getBalance({ owner: existingDelegator.signingAddress });
+      if (cancelled) return;
+
+      setSignerBalanceMist(balance.totalBalance);
+    }
+
+    void syncWalletDelegator();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [account?.address, suiClient]);
 
   async function checkHealth() {
     setError(null);
@@ -159,6 +197,15 @@ export default function App() {
             }
           : prev,
       );
+
+      const existingDelegator = await loadDelegator(nextBundle.delegator_address, {
+        allowMissing: true,
+        withLoading: false,
+      });
+
+      if (existingDelegator) {
+        setError("This wallet already has a delegator. The app loaded the existing object; skip Create and continue with fund, rebind, execute, or rotate.");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -191,30 +238,71 @@ export default function App() {
       await suiClient.waitForTransaction({ digest });
       await refreshDelegator(keyBundle.delegator_address);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+
+      if (message.includes("derived_object::claim")) {
+        await loadDelegator(keyBundle.delegator_address, { allowMissing: true, withLoading: false });
+        setError(
+          "This wallet already claimed its derived delegator. Use the loaded delegator instead of creating a second one.",
+        );
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(null);
     }
   }
 
   async function fundSigner() {
-    if (!keyBundle || !account) return;
+    const signerAddress = signerFundingTarget;
+    if (!signerAddress || !account) return;
 
     setError(null);
     setLoading("fund");
     try {
       const tx = new Transaction();
       const [coin] = tx.splitCoins(tx.gas, [FUND_AMOUNT_MIST]);
-      tx.transferObjects([coin], keyBundle.signing_address);
+      tx.transferObjects([coin], signerAddress);
 
       const digest = await submitWalletTransaction(signAndExecute, tx);
       setFundDigest(digest);
       await suiClient.waitForTransaction({ digest });
-      await refreshSignerBalance(keyBundle.signing_address);
+      await refreshSignerBalance(signerAddress);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(null);
+    }
+  }
+
+  async function loadDelegator(
+    objectId: string,
+    options: { allowMissing: boolean; withLoading: boolean },
+  ): Promise<DelegatorView | null> {
+    if (options.withLoading) {
+      setError(null);
+      setLoading("refresh");
+    }
+
+    try {
+      const nextDelegator = await readDelegator(suiClient, objectId);
+      if (!nextDelegator) {
+        if (options.allowMissing) return null;
+        throw new Error("delegator object not found on-chain yet");
+      }
+
+      setDelegator(nextDelegator);
+      await refreshSignerBalance(nextDelegator.signingAddress);
+      return nextDelegator;
+    } catch (e) {
+      if (!options.allowMissing) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return null;
+    } finally {
+      if (options.withLoading) {
+        setLoading(null);
+      }
     }
   }
 
@@ -222,38 +310,7 @@ export default function App() {
     if (!objectId) return;
 
     setError(null);
-    setLoading("refresh");
-    try {
-      const response = await suiClient.getObject({
-        id: objectId,
-        options: { showContent: true },
-      });
-
-      const fields =
-        response.data?.content?.dataType === "moveObject" && !Array.isArray(response.data.content.fields)
-          ? (response.data.content.fields as Record<string, unknown>)
-          : null;
-
-      if (!fields) throw new Error("delegator object not found on-chain yet");
-
-      const nextDelegator = {
-        objectId,
-        owner: expectString(fields.owner, "owner"),
-        signingAddress: expectString(fields.signing_address, "signing_address"),
-        enclaveAddress: expectString(fields.enclave_address, "enclave_address"),
-        keyVersion: expectString(fields.key_version, "key_version"),
-        encryptedSkBytes: expectByteArray(fields.encrypted_sk, "encrypted_sk").length,
-        sealedAesKeyBytes: expectByteArray(fields.sealed_aes_key, "sealed_aes_key").length,
-        allowedTargets: expectStringArray(fields.allowed_targets, "allowed_targets"),
-      } satisfies DelegatorView;
-
-      setDelegator(nextDelegator);
-      await refreshSignerBalance(nextDelegator.signingAddress);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(null);
-    }
+    await loadDelegator(objectId, { allowMissing: false, withLoading: true });
   }
 
   async function refreshSignerBalance(address: string) {
@@ -353,8 +410,8 @@ export default function App() {
       </section>
 
       <section className="steps">
-        <Step n="1" label="Prove Owner" active={!keyBundle} done={!!keyBundle} />
-        <div className={`step-line ${keyBundle ? "done" : ""}`} />
+        <Step n="1" label="Prove Owner" active={!keyBundle && !delegator} done={!!keyBundle || !!delegator} />
+        <div className={`step-line ${keyBundle || delegator ? "done" : ""}`} />
         <Step n="2" label="Create Delegator" active={!!keyBundle && !delegator} done={!!delegator} />
         <div className={`step-line ${delegator ? "done" : ""}`} />
         <Step
@@ -428,13 +485,17 @@ export default function App() {
               <button
                 className="primary"
                 onClick={() => void createDelegator()}
-                disabled={!keyBundle || loading === "create" || isPending}
+                disabled={!keyBundle || !!delegator || loading === "create" || isPending}
               >
-                {loading === "create" ? "Creating..." : "Create delegator on-chain"}
+                {loading === "create"
+                  ? "Creating..."
+                  : delegator
+                    ? "Delegator already exists"
+                    : "Create delegator on-chain"}
               </button>
               <button
                 onClick={() => void fundSigner()}
-                disabled={!keyBundle || loading === "fund" || isPending}
+                disabled={!signerFundingTarget || loading === "fund" || isPending}
               >
                 {loading === "fund" ? "Funding..." : "Fund signer with 0.2 SUI"}
               </button>
@@ -571,6 +632,17 @@ function buildKeygenMessage(ownerAddress: string, challenge: string) {
   return `vault-demo::keygen|${PACKAGE_ID}|${REGISTRY_ID}|${ownerAddress}|${challenge}`;
 }
 
+function deriveDelegatorAddress(ownerAddress: string) {
+  const keyBytes = bcs
+    .struct("DelegatorKey", {
+      owner: bcs.Address,
+    })
+    .serialize({ owner: ownerAddress })
+    .toBytes();
+
+  return deriveObjectID(REGISTRY_ID, `${PACKAGE_ID}::conductor_demo::DelegatorKey`, keyBytes);
+}
+
 function shorten(value: string) {
   if (value.length <= 18) return value;
   return `${value.slice(0, 10)}...${value.slice(-8)}`;
@@ -621,6 +693,34 @@ function hexToBytes(hex: string) {
 
 function normalizeHex(value: string) {
   return value.startsWith("0x") ? value.toLowerCase() : `0x${value.toLowerCase()}`;
+}
+
+async function readDelegator(
+  suiClient: ReturnType<typeof useSuiClient>,
+  objectId: string,
+): Promise<DelegatorView | null> {
+  const response = await suiClient.getObject({
+    id: objectId,
+    options: { showContent: true },
+  });
+
+  const fields =
+    response.data?.content?.dataType === "moveObject" && !Array.isArray(response.data.content.fields)
+      ? (response.data.content.fields as Record<string, unknown>)
+      : null;
+
+  if (!fields) return null;
+
+  return {
+    objectId,
+    owner: expectString(fields.owner, "owner"),
+    signingAddress: expectString(fields.signing_address, "signing_address"),
+    enclaveAddress: expectString(fields.enclave_address, "enclave_address"),
+    keyVersion: expectString(fields.key_version, "key_version"),
+    encryptedSkBytes: expectByteArray(fields.encrypted_sk, "encrypted_sk").length,
+    sealedAesKeyBytes: expectByteArray(fields.sealed_aes_key, "sealed_aes_key").length,
+    allowedTargets: expectStringArray(fields.allowed_targets, "allowed_targets"),
+  } satisfies DelegatorView;
 }
 
 function expectString(value: unknown, field: string) {
